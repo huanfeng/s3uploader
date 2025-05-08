@@ -1,0 +1,29 @@
+# Default profile
+default: p1
+
+# Profile 1
+p1:
+  access_key: your_access_key
+  secret_key: your_secret_key
+  endpoint: your_enpoint
+  bucket: bucket1
+  region: auto
+  part_size: 64
+  concurrency: 8
+  resume: false
+  proxy: ""
+
+# Another profile
+p2:
+  access_key: your_access_key
+  secret_key: your_secret_key
+  endpoint: your_enpoint
+  bucket: bucket2
+  region: auto
+  part_size: 64
+  concurrency: 8
+  resume: false
+
+# Global config (for all profile)
+global:
+  json_output: false
