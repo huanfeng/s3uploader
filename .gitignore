@@ -1,1 +1,5 @@
 *.exe
+myconfig.yaml
+
+# Added by goreleaser init:
+dist/
