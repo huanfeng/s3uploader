@@ -15,9 +15,11 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -623,6 +625,8 @@ func clearUploadState(cfg *Config, filePath string) error {
 }
 
 func uploadFile(client *s3.Client, cfg *Config, filePath string, key string, reporter *ProgressReporter) error {
+	// 使用全局上下文
+	ctx := globalCtx
 	file, err := os.Open(filePath)
 	if err != nil {
 		return err
@@ -678,7 +682,7 @@ func uploadFile(client *s3.Client, cfg *Config, filePath string, key string, rep
 	} else {
 		// 创建新的分段上传
 		log.Printf("Starting new upload: %s (%d MB) divided into %d parts", key, fileSize/1e6, numParts)
-		createResp, err := client.CreateMultipartUpload(context.TODO(), &s3.CreateMultipartUploadInput{
+		createResp, err := client.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{
 			Bucket: aws.String(cfg.Bucket),
 			Key:    aws.String(key),
 		})
@@ -735,7 +739,7 @@ func uploadFile(client *s3.Client, cfg *Config, filePath string, key string, rep
 	if len(partsToUpload) == 0 {
 		log.Printf("All parts already uploaded, completing upload directly")
 		// 完成上传
-		_, err = client.CompleteMultipartUpload(context.TODO(), &s3.CompleteMultipartUploadInput{
+		_, err = client.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{
 			Bucket:          aws.String(cfg.Bucket),
 			Key:             aws.String(key),
 			UploadId:        aws.String(uploadID),
@@ -749,6 +753,9 @@ func uploadFile(client *s3.Client, cfg *Config, filePath string, key string, rep
 		clearUploadState(cfg, filePath)
 		return nil
 	}
+
+	// 创建一个通道，用于接收取消信号
+	abortChan := make(chan struct{})
 
 	// 对需要上传的分片进行上传
 	for partNumber := range partsToUpload {
@@ -811,7 +818,7 @@ func uploadFile(client *s3.Client, cfg *Config, filePath string, key string, rep
 				}
 
 				// 上传分片
-				resp, err := client.UploadPart(context.TODO(), &s3.UploadPartInput{
+				resp, err := client.UploadPart(ctx, &s3.UploadPartInput{
 					Bucket:     aws.String(cfg.Bucket),
 					Key:        aws.String(key),
 					PartNumber: aws.Int32(int32(partNum)),
@@ -858,15 +865,40 @@ func uploadFile(client *s3.Client, cfg *Config, filePath string, key string, rep
 		}(partNumber)
 	}
 
-	// 等待所有上传完成
-	wg.Wait()
-	close(errChan)
+	// 等待所有上传完成或取消信号
+	go func() {
+		wg.Wait()
+		close(errChan)
+		close(abortChan) // 所有任务完成，关闭取消通道
+	}()
+
+	// 等待完成或取消
+	select {
+	case <-abortChan: // 所有上传任务完成
+		// 继续执行
+	case <-ctx.Done(): // 上下文被取消
+		// 如果不支持断点续传，则取消上传
+		if !cfg.ResumeUpload {
+			verboseLog("Upload interrupted, canceling upload task...")
+			_, abortErr := client.AbortMultipartUpload(context.Background(), &s3.AbortMultipartUploadInput{
+				Bucket:   aws.String(cfg.Bucket),
+				Key:      aws.String(key),
+				UploadId: aws.String(uploadID),
+			})
+			if abortErr != nil {
+				errorLog("Failed to cancel upload: %v", abortErr)
+			} else {
+				infoLog("Upload task successfully canceled")
+			}
+		}
+		return ctx.Err()
+	}
 
 	// 检查是否有错误发生
 	for err := range errChan {
 		if err != nil {
 			// 尝试中止上传
-			_, abortErr := client.AbortMultipartUpload(context.TODO(), &s3.AbortMultipartUploadInput{
+			_, abortErr := client.AbortMultipartUpload(ctx, &s3.AbortMultipartUploadInput{
 				Bucket:   aws.String(cfg.Bucket),
 				Key:      aws.String(key),
 				UploadId: aws.String(uploadID),
@@ -879,7 +911,7 @@ func uploadFile(client *s3.Client, cfg *Config, filePath string, key string, rep
 	}
 
 	// 完成上传
-	_, err = client.CompleteMultipartUpload(context.TODO(), &s3.CompleteMultipartUploadInput{
+	_, err = client.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{
 		Bucket:          aws.String(cfg.Bucket),
 		Key:             aws.String(key),
 		UploadId:        aws.String(uploadID),
@@ -1113,7 +1145,28 @@ func errorLog(format string, v ...interface{}) {
 	log.Printf(format, v...)
 }
 
+// 全局上下文和取消函数
+var (
+	globalCtx context.Context
+	globalCancel context.CancelFunc
+)
+
 func main() {
+	// 设置信号处理
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+
+	// 创建一个可取消的上下文
+	globalCtx, globalCancel = context.WithCancel(context.Background())
+
+	// 监听中断信号
+	go func() {
+		<-sigChan
+		fmt.Println("\nReceived interrupt signal, canceling upload...")
+		globalCancel() // 取消上下文
+	}()
+	defer globalCancel()
+
 	// Define flags
 	configFile := flag.String("config", "", "Config file path (YAML)")
 	profile := flag.String("profile", "", "Profile name in config file")
@@ -1392,6 +1445,12 @@ func main() {
 
 	// Upload File
 	err = uploadFile(client, cfg, filePath, remoteKey, reporter)
+
+	// 如果是因为上下文取消导致的错误，显示友好的消息
+	if err == context.Canceled {
+		infoLog("Upload canceled by user")
+		os.Exit(1)
+	}
 	if err != nil {
 		errorLog("Upload failed: %v", err)
 		os.Exit(1)
