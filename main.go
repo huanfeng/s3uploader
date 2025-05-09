@@ -757,6 +757,31 @@ func uploadFile(client *s3.Client, cfg *Config, filePath string, key string, rep
 	// 创建一个通道，用于接收取消信号
 	abortChan := make(chan struct{})
 
+	// 创建一个通道用于取消正在进行的上传任务
+	cancelChan := make(chan struct{})
+	
+	// 监听上下文取消
+	go func() {
+		<-ctx.Done()
+		// 关闭取消通道，通知所有正在进行的上传任务
+		close(cancelChan)
+		
+		// 如果不支持断点续传，则立即取消上传
+		if !cfg.ResumeUpload {
+			verboseLog("Upload interrupted, canceling upload task...")
+			_, abortErr := client.AbortMultipartUpload(context.Background(), &s3.AbortMultipartUploadInput{
+				Bucket:   aws.String(cfg.Bucket),
+				Key:      aws.String(key),
+				UploadId: aws.String(uploadID),
+			})
+			if abortErr != nil {
+				errorLog("Failed to cancel upload: %v", abortErr)
+			} else {
+				infoLog("Upload task successfully canceled")
+			}
+		}
+	}()
+	
 	// 对需要上传的分片进行上传
 	for partNumber := range partsToUpload {
 		wg.Add(1)
@@ -769,6 +794,15 @@ func uploadFile(client *s3.Client, cfg *Config, filePath string, key string, rep
 			// 最多重试 3 次
 			maxRetries := 3
 			var lastErr error
+			
+			// 检查是否已取消
+			select {
+			case <-cancelChan:
+				// 任务已取消，直接返回
+				return
+			default:
+				// 继续执行
+			}
 
 			for retry := 0; retry < maxRetries; retry++ {
 				// 如果是重试，等待一段时间
@@ -817,14 +851,31 @@ func uploadFile(client *s3.Client, cfg *Config, filePath string, key string, rep
 					Size:     int64(n),
 				}
 
+				// 创建一个可取消的上下文用于这个分片上传
+				partCtx, partCancel := context.WithCancel(ctx)
+				
+				// 监听取消信号
+				go func() {
+					select {
+					case <-cancelChan:
+						// 取消这个分片的上传
+						partCancel()
+					case <-partCtx.Done():
+						// 分片上传已经完成或被取消
+					}
+				}()
+				
 				// 上传分片
-				resp, err := client.UploadPart(ctx, &s3.UploadPartInput{
+				resp, err := client.UploadPart(partCtx, &s3.UploadPartInput{
 					Bucket:     aws.String(cfg.Bucket),
 					Key:        aws.String(key),
 					PartNumber: aws.Int32(int32(partNum)),
 					UploadId:   aws.String(uploadID),
 					Body:       progressReader,
 				})
+				
+				// 释放资源
+				partCancel()
 
 				if err != nil {
 					lastErr = fmt.Errorf("error uploading part %d: %v", partNum, err)
@@ -872,25 +923,12 @@ func uploadFile(client *s3.Client, cfg *Config, filePath string, key string, rep
 		close(abortChan) // 所有任务完成，关闭取消通道
 	}()
 
-	// 等待完成或取消
+	// 等待所有任务完成或者上下文被取消
 	select {
 	case <-abortChan: // 所有上传任务完成
 		// 继续执行
 	case <-ctx.Done(): // 上下文被取消
-		// 如果不支持断点续传，则取消上传
-		if !cfg.ResumeUpload {
-			verboseLog("Upload interrupted, canceling upload task...")
-			_, abortErr := client.AbortMultipartUpload(context.Background(), &s3.AbortMultipartUploadInput{
-				Bucket:   aws.String(cfg.Bucket),
-				Key:      aws.String(key),
-				UploadId: aws.String(uploadID),
-			})
-			if abortErr != nil {
-				errorLog("Failed to cancel upload: %v", abortErr)
-			} else {
-				infoLog("Upload task successfully canceled")
-			}
-		}
+		// 已经在上面的goroutine中处理了取消逻辑
 		return ctx.Err()
 	}
 
